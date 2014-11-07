@@ -1,0 +1,253 @@
+diff -ruNp src_clean/include/minix/config.h proj1/include/minix/config.h
+--- src_clean/include/minix/config.h	Sat Apr 13 06:32:30 2013
++++ proj1/include/minix/config.h	Fri Apr 26 06:13:39 2013
+@@ -68,9 +68,9 @@
+ /* Scheduling priorities. Values must start at zero (highest
+  * priority) and increment.
+  */
+-#define NR_SCHED_QUEUES   16	/* MUST equal minimum priority + 1 */
++#define NR_SCHED_QUEUES   19	/* MUST equal minimum priority + 1 */   /////////////////////////////////////////////// 
+ #define TASK_Q		   0	/* highest, used for kernel tasks */
+-#define MAX_USER_Q  	   0    /* highest priority for user processes */   
++#define MAX_USER_Q  	   16    /* highest priority for user processes */   ////////////////////////////////////////////
+ #define USER_Q  	  ((MIN_USER_Q - MAX_USER_Q) / 2 + MAX_USER_Q) /* default
+ 						(should correspond to nice 0) */
+ #define MIN_USER_Q	  (NR_SCHED_QUEUES - 1)	/* minimum priority for user
+diff -ruNp src_clean/servers/sched/schedproc.h proj1/servers/sched/schedproc.h
+--- src_clean/servers/sched/schedproc.h	Sat Apr 13 06:32:40 2013
++++ proj1/servers/sched/schedproc.h	Fri Apr 26 06:13:17 2013
+@@ -29,7 +29,8 @@ EXTERN struct schedproc {
+ 	unsigned max_priority;	/* this process' highest allowed priority */
+ 	unsigned priority;		/* the process' current priority */
+ 	unsigned time_slice;		/* this process's time slice */
+-	unsigned cpu;		/* what CPU is the process running on */
++	unsigned cpu;	/* what CPU is the process running on */
++	int tickets;	////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+ 	bitchunk_t cpu_mask[BITMAP_CHUNKS(CONFIG_MAX_CPUS)]; /* what CPUs is hte
+ 								process allowed
+ 								to run on */
+diff -ruNp src_clean/servers/sched/schedule.c proj1/servers/sched/schedule.c
+--- src_clean/servers/sched/schedule.c	Sat Apr 13 06:32:40 2013
++++ proj1/servers/sched/schedule.c	Fri Apr 26 06:12:51 2013
+@@ -1,3 +1,4 @@
++//Alex King, Manuel Perez
+ /* This file contains the scheduling policy for SCHED
+  *
+  * The entry points are:
+@@ -11,8 +12,10 @@
+ #include "schedproc.h"
+ #include <assert.h>
+ #include <minix/com.h>
++#include <minix/syslib.h>
+ #include <machine/archtypes.h>
+ #include "kernel/proc.h" /* for queue constants */
++#include <time.h>
+ 
+ static timer_t sched_timer;
+ static unsigned balance_timeout;
+@@ -21,7 +24,11 @@ static unsigned balance_timeout;
+ 
+ static int schedule_process(struct schedproc * rmp, unsigned flags);
+ static void balance_queues(struct timer *tp);
++int lotteryScheduler(void);
++void setpriority(struct schedproc* rmp, int ntickets);
++int inUserQueue(struct schedproc* rmp);
+ 
++
+ #define SCHEDULE_CHANGE_PRIO	0x1
+ #define SCHEDULE_CHANGE_QUANTUM	0x2
+ #define SCHEDULE_CHANGE_CPU	0x4
+@@ -98,14 +105,20 @@ int do_noquantum(message *m_ptr)
+ 		return EBADEPT;
+ 	}
+ 
+-	rmp = &schedproc[proc_nr_n];
+-	if (rmp->priority < MIN_USER_Q) {
+-		rmp->priority += 1; /* lower priority */
++	rmp = &schedproc[proc_nr_n]; //////////////////////////////////////////////////////////////////
++	if (inUserQueue(rmp)) {
++		rmp->priority = USER_Q;
+ 	}
++	else if(rmp->priority < MAX_USER_Q -1){
++		rmp->priority += 1; /* lower priority */
++	} /////////////////////////////////////////////////////////////////////////////////////
+ 
+ 	if ((rv = schedule_process_local(rmp)) != OK) {
+ 		return rv;
+ 	}
++	//Taking away ticket
++	setpriority(rmp, -1);
++	rv = lotteryScheduler();  ///////////////////////////////////////////////////////////
+ 	return OK;
+ }
+ 
+@@ -133,6 +146,8 @@ int do_stop_scheduling(message *m_ptr)
+ #endif
+ 	rmp->flags = 0; /*&= ~IN_USE;*/
+ 
++	setpriority(rmp, 1);
++	lotteryScheduler(); ///////////////////////////////////////////////////////////////
+ 	return OK;
+ }
+ 
+@@ -163,6 +178,7 @@ int do_start_scheduling(message *m_ptr)
+ 	rmp->endpoint     = m_ptr->SCHEDULING_ENDPOINT;
+ 	rmp->parent       = m_ptr->SCHEDULING_PARENT;
+ 	rmp->max_priority = (unsigned) m_ptr->SCHEDULING_MAXPRIO;
++	rmp->tickets = 5;   //////////////////////////////////////////////////////////////////////////
+ 	if (rmp->max_priority >= NR_SCHED_QUEUES) {
+ 		return EINVAL;
+ 	}
+@@ -258,6 +274,7 @@ int do_nice(message *m_ptr)
+ 	struct schedproc *rmp;
+ 	int rv;
+ 	int proc_nr_n;
++	int tickets_old;
+ 	unsigned new_q, old_q, old_max_q;
+ 
+ 	/* check who can send you requests */
+@@ -279,18 +296,25 @@ int do_nice(message *m_ptr)
+ 	/* Store old values, in case we need to roll back the changes */
+ 	old_q     = rmp->priority;
+ 	old_max_q = rmp->max_priority;
++	tickets_old = rmp->tickets;
+ 
+ 	/* Update the proc entry and reschedule the process */
+-	rmp->max_priority = rmp->priority = new_q;
+-
++	rmp->priority = USER_Q;
++	//add or subtract tickets according to increaed or decrease "intended" priority
++	if(new_q>old_q)
++		setpriority(rmp,-1);//////////////////////////////////////////////////////////////////////
++	else if(new_q<old_q)
++		setpriority(rmp,1);
++		
+ 	if ((rv = schedule_process_local(rmp)) != OK) {
+ 		/* Something went wrong when rescheduling the process, roll
+ 		 * back the changes to proc struct */
+ 		rmp->priority     = old_q;
+ 		rmp->max_priority = old_max_q;
++		rmp->tickets = tickets_old;
+ 	}
+ 
+-	return rv;
++	return lotteryScheduler();
+ }
+ 
+ /*===========================================================================*
+@@ -329,7 +353,7 @@ static int schedule_process(struct schedproc * rmp, un
+ 
+ 
+ /*===========================================================================*
+- *				start_scheduling			     *
++ *				init_scheduling			     *
+  *===========================================================================*/
+ 
+ void init_scheduling(void)
+@@ -337,6 +361,7 @@ void init_scheduling(void)
+ 	balance_timeout = BALANCE_TIMEOUT * sys_hz();
+ 	init_timer(&sched_timer);
+ 	set_timer(&sched_timer, balance_timeout, balance_queues, 0);
++	//srandom(time(NULL));
+ }
+ 
+ /*===========================================================================*
+@@ -355,12 +380,93 @@ static void balance_queues(struct timer *tp)
+ 
+ 	for (proc_nr=0, rmp=schedproc; proc_nr < NR_PROCS; proc_nr++, rmp++) {
+ 		if (rmp->flags & IN_USE) {
+-			if (rmp->priority > rmp->max_priority) {
+-				rmp->priority -= 1; /* increase priority */
+-				schedule_process_local(rmp);
++			if (!inUserQueue(rmp)) {
++				if (rmp->priority > rmp->max_priority) {
++					rmp->priority -= 1; /* increase priority */
++					schedule_process_local(rmp);
++				}
+ 			}
+ 		}
+ 	}
+ 
+ 	set_timer(&sched_timer, balance_timeout, balance_queues, 0);
+-}
++}
++
++
++/*===========================================================================*
++ *				lotteryScheduler		    *
++ *===========================================================================*/
++ 
++ int lotteryScheduler(void) {
++	
++	struct schedproc *rmp;
++	int i, old, winner, totalTickets=0, counter=0;
++	
++	//seed
++	//srandom(time(NULL));
++	//counting total tickets
++	for(i = 0; i < NR_PROCS; i++)
++	{
++		rmp = &schedproc[i];
++		if((rmp->flags == IN_USE) && inUserQueue(rmp) && (USER_Q == rmp->priority))
++		{
++			totalTickets += rmp->tickets;
++		}
++	}
++	
++	//picking a winning ticket (yaking into consideration the total=0)
++	if(totalTickets==0)
++	{
++		winner=0;
++	}
++	else
++		winner = random() % totalTickets;
++	
++	//Finding the winner
++	for(i = 0; i < NR_PROCS; i++)
++	{
++		rmp = &schedproc[i];
++		if((rmp->flags == IN_USE) && inUserQueue(rmp) && (USER_Q == rmp->priority))
++		{
++			
++			if(counter <=winner)
++			{
++				counter = counter + rmp->tickets;
++				old = rmp->priority;
++				if(counter > winner)
++				{
++					rmp->priority = MAX_USER_Q;
++				}
++			}
++			if(old != rmp->priority)
++			{
++				schedule_process(rmp,SCHEDULE_CHANGE_ALL);
++			}
++		}
++	}
++	
++	return 0;
++}
++
++
++void setpriority(struct schedproc* rmp, int ntickets) {
++	
++	rmp->tickets += ntickets;
++	if(rmp->tickets > 100) {
++		rmp->tickets = 100;
++	}
++	else if(rmp->tickets < 1) {
++		rmp->tickets = 1;
++	}
++	
++}
++
++int inUserQueue(struct schedproc* rmp) {
++	
++	if (rmp->priority >= MAX_USER_Q && rmp->priority <= MIN_USER_Q) {
++		return 1;
++	}
++	else {
++		return 0;
++	}
++}
+\ No newline at end of file
